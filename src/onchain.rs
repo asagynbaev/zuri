@@ -18,6 +18,7 @@
 //! ```
 
 use {
+    crate::{ct::PERIOD_MEMO, fmt_month, parse_month},
     anyhow::{Context, Result, anyhow, bail, ensure},
     solana_address::Address,
     solana_commitment_config::CommitmentConfig,
@@ -181,6 +182,31 @@ pub struct Transfer {
     pub block_time: Option<i64>,
     pub ix: TransferIx,
     pub validity: BatchedGroupedCiphertext3HandlesValidityProofContext,
+    pub memo_period: Option<String>,
+}
+
+impl Transfer {
+    /// Pay period from the employer's memo, or the month of the block.
+    pub fn period(&self) -> Result<String> {
+        match &self.memo_period {
+            Some(period) => Ok(period.clone()),
+            None => Ok(fmt_month(self.block_time.context("no block time")?)),
+        }
+    }
+}
+
+/// A period memo counts only if the transfer authority signed it.
+fn find_period_memo(tx: &VersionedTransaction, authority: &Address) -> Option<String> {
+    instructions(tx)
+        .into_iter()
+        .find_map(|(program, accounts, data)| {
+            if program != spl_memo_interface::v3::ID || !accounts.contains(authority) {
+                return None;
+            }
+            let period = std::str::from_utf8(data).ok()?.strip_prefix(PERIOD_MEMO)?;
+            parse_month(period).ok()?;
+            Some(period.to_string())
+        })
 }
 
 /// Loads a transfer and its ciphertexts starting from the transfer signature.
@@ -202,12 +228,14 @@ pub async fn fetch_transfer(rpc: &RpcClient, signature: &Signature) -> Result<Tr
     for entry in history.iter().filter(|e| e.err.is_none()) {
         let tx = fetch_tx(rpc, &Signature::from_str(&entry.signature)?).await?;
         if let Some(validity) = find_validity_context(&tx.tx, &ix.validity_context)? {
+            let memo_period = find_period_memo(&transfer.tx, &ix.authority);
             return Ok(Transfer {
                 signature: *signature,
                 slot: transfer.slot,
                 block_time: transfer.block_time,
                 ix,
                 validity,
+                memo_period,
             });
         }
     }

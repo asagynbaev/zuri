@@ -7,7 +7,7 @@ use {
     std::{path::Path, str::FromStr},
     zuri::{
         chain::{Chain, LAMPORTS_PER_SOL},
-        ct, fmt_amount, keys, onchain, parse_amount, proof,
+        ct, fmt_amount, keys, onchain, parse_amount, parse_month, proof,
         store::Payroll,
     },
 };
@@ -15,12 +15,14 @@ use {
 const USAGE: &str = "usage: zuri <command>
 
   setup                  create the mint and both confidential accounts
-  pay <amount>...        pay salaries from employer to employee
+  pay <amount[@YYYY-MM]>...
+                         pay salaries, optionally tagged with a pay period
   apply                  employee applies pending balance
   balances               decrypted balances of both sides
   demo                   setup + three salaries + apply + balances
   inspect                read every paid salary back from the chain
-  prove <min> [file]     employee proves total income >= min
+  prove <min> [--monthly] [file]
+                         employee proves income >= min, in total or every month
   fund <keypair> <sol>   send SOL to the employer from another wallet";
 
 const DEMO_SALARIES: [&str; 3] = ["3200", "3450.50", "3100"];
@@ -37,24 +39,28 @@ async fn main() -> Result<()> {
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["setup"] => setup(&chain, &employee).await?,
         ["pay", ..] if args.len() > 1 => {
-            let amounts = args[1..]
+            let salaries = args[1..]
                 .iter()
-                .map(|a| parse_amount(a))
+                .map(|a| parse_salary(a))
                 .collect::<Result<Vec<_>>>()?;
-            pay(&chain, &employee, &mint, &amounts).await?;
+            pay(&chain, &employee, &mint, &salaries).await?;
         }
         ["apply"] => apply(&chain, &employee, &mint).await?,
         ["balances"] => balances(&chain, &employee, &mint).await?,
         ["demo"] => {
             setup(&chain, &employee).await?;
-            let amounts = DEMO_SALARIES.map(|a| parse_amount(a).unwrap());
-            pay(&chain, &employee, &mint, &amounts).await?;
+            let salaries = DEMO_SALARIES.map(|a| parse_salary(a).unwrap());
+            pay(&chain, &employee, &mint, &salaries).await?;
             apply(&chain, &employee, &mint).await?;
             balances(&chain, &employee, &mint).await?;
         }
         ["inspect"] => inspect(&chain, &employee, &mint).await?,
-        ["prove", min] => prove(&chain, &employee, &mint, min, ".zuri/proof.json").await?,
-        ["prove", min, out] => prove(&chain, &employee, &mint, min, out).await?,
+        ["prove", min, ref rest @ ..] if rest.len() <= 2 => {
+            let monthly = rest.contains(&"--monthly");
+            let out = rest.iter().find(|a| **a != "--monthly");
+            let out = out.copied().unwrap_or(".zuri/proof.json");
+            prove(&chain, &employee, &mint, min, monthly, out).await?;
+        }
         ["fund", path, sol] => {
             let from = keys::read(Path::new(path))?;
             let lamports = (sol.parse::<f64>()? * LAMPORTS_PER_SOL as f64) as u64;
@@ -107,12 +113,40 @@ async fn fund_employer(chain: &Chain, mint: &Address, needed: u64) -> Result<()>
     Ok(())
 }
 
-async fn pay(chain: &Chain, employee: &Keypair, mint: &Address, amounts: &[u64]) -> Result<()> {
+/// "3200" or "3200@2026-04".
+fn parse_salary(s: &str) -> Result<(u64, Option<String>)> {
+    match s.split_once('@') {
+        Some((amount, period)) => {
+            parse_month(period)?;
+            Ok((parse_amount(amount)?, Some(period.to_string())))
+        }
+        None => Ok((parse_amount(s)?, None)),
+    }
+}
+
+async fn pay(
+    chain: &Chain,
+    employee: &Keypair,
+    mint: &Address,
+    salaries: &[(u64, Option<String>)],
+) -> Result<()> {
     let mut payroll = Payroll::load()?;
-    fund_employer(chain, mint, amounts.iter().sum()).await?;
-    for &amount in amounts {
-        println!("salary {}", fmt_amount(amount));
-        let record = ct::transfer(chain, &chain.payer, mint, &employee.pubkey(), amount).await?;
+    fund_employer(chain, mint, salaries.iter().map(|s| s.0).sum()).await?;
+    for (amount, period) in salaries {
+        match period {
+            Some(period) => println!("salary {} for {period}", fmt_amount(*amount)),
+            None => println!("salary {}", fmt_amount(*amount)),
+        }
+        let employee = employee.pubkey();
+        let record = ct::transfer(
+            chain,
+            &chain.payer,
+            mint,
+            &employee,
+            *amount,
+            period.as_deref(),
+        )
+        .await?;
         payroll.transfers.push(record);
         payroll.save()?;
     }
@@ -178,6 +212,10 @@ async fn inspect(chain: &Chain, employee: &Keypair, mint: &Address) -> Result<()
         total += amount;
 
         println!("{sig}");
+        match &t.memo_period {
+            Some(period) => println!("  period {period} (employer memo)"),
+            None => println!("  period {} (block time)", t.period()?),
+        }
         println!(
             "  slot {}, validity context {}",
             t.slot, t.ix.validity_context
@@ -209,16 +247,20 @@ async fn prove(
     employee: &Keypair,
     mint: &Address,
     min: &str,
+    monthly: bool,
     out: &str,
 ) -> Result<()> {
     let min = parse_amount(min)?;
     let transfers = transfer_signatures()?;
-    let (proof, total) = proof::prove(&chain.rpc, employee, mint, &transfers, min).await?;
+    let (proof, totals) =
+        proof::prove(&chain.rpc, employee, mint, &transfers, min, monthly).await?;
     std::fs::write(out, serde_json::to_string_pretty(&proof)?)?;
+    for (period, total) in totals {
+        println!("{period}: {}", fmt_amount(total));
+    }
     println!(
-        "{} transfers, total {}, proved >= {} -> {out}",
+        "{} transfers, proved >= {} per period -> {out}",
         transfers.len(),
-        fmt_amount(total),
         fmt_amount(min)
     );
     Ok(())

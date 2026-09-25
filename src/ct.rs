@@ -229,6 +229,17 @@ pub async fn apply_pending(chain: &Chain, owner: &Keypair, mint: &Address) -> Re
     Ok(Some(b.pending))
 }
 
+pub const PERIOD_MEMO: &str = "zuri period ";
+
+/// Pay period the employer attaches to a salary transfer, signed by the employer.
+pub fn period_memo(employer: &Address, period: &str) -> solana_instruction::Instruction {
+    spl_memo_interface::instruction::build_memo(
+        &spl_memo_interface::v3::ID,
+        format!("{PERIOD_MEMO}{period}").as_bytes(),
+        &[employer],
+    )
+}
+
 fn ctx<'a>(account: &'a Address, authority: &'a Address) -> ContextStateInfo<'a> {
     ContextStateInfo {
         context_state_account: account,
@@ -246,6 +257,7 @@ pub async fn transfer(
     mint: &Address,
     recipient: &Address,
     amount: u64,
+    period: Option<&str>,
 ) -> Result<TransferRecord> {
     let payer = chain.payer.pubkey();
     let source = token_account(&sender.pubkey(), mint);
@@ -429,10 +441,15 @@ pub async fn transfer(
         close(&range_ctx),
         spl_record::instruction::close_account(&record.pubkey(), &payer, &payer),
     ];
+    let mut ixs = ixs.to_vec();
+    if let Some(period) = period {
+        ixs.push(period_memo(&sender.pubkey(), period));
+    }
     let transfer_sig = chain.send("transfer", &ixs, &[sender]).await?;
 
     Ok(TransferRecord {
         amount,
+        period: period.map(str::to_string),
         equality_context: equality_ctx.to_string(),
         validity_context: validity_ctx.to_string(),
         range_context: range_ctx.to_string(),

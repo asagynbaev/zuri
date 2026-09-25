@@ -3585,6 +3585,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "spl-memo-interface"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3745d384b0afee980d43d62b66c27bdcbbd03507732b8d3626d3413cb72084f2"
+dependencies = [
+ "solana-instruction 3.5.1",
+ "solana-pubkey 4.4.0",
+]
+
+[[package]]
 name = "spl-record"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4554,6 +4564,7 @@ dependencies = [
  "solana-zk-sdk",
  "solana-zk-sdk-pod",
  "spl-associated-token-account-interface",
+ "spl-memo-interface",
  "spl-record",
  "spl-token-2022-interface",
  "spl-token-confidential-transfer-proof-extraction",

@@ -19,6 +19,9 @@ pub struct Payroll {
 pub struct TransferRecord {
     /// Plaintext amount, for debugging only.
     pub amount: u64,
+    /// Pay period written by the employer in a memo, YYYY-MM.
+    #[serde(default)]
+    pub period: Option<String>,
     pub equality_context: String,
     pub validity_context: String,
     pub range_context: String,

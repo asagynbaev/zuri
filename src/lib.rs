@@ -40,6 +40,20 @@ pub fn fmt_date(unix: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+pub fn fmt_month(unix: i64) -> String {
+    fmt_date(unix)[..7].to_string()
+}
+
+/// "YYYY-MM" to a month index, so consecutive months differ by one.
+pub fn parse_month(s: &str) -> anyhow::Result<i64> {
+    let bad = || anyhow::anyhow!("expected YYYY-MM, got {s}");
+    let (y, m) = s.split_once('-').ok_or_else(bad)?;
+    anyhow::ensure!(y.len() == 4 && m.len() == 2, bad());
+    let (y, m): (i64, i64) = (y.parse().map_err(|_| bad())?, m.parse().map_err(|_| bad())?);
+    anyhow::ensure!((1..=12).contains(&m), bad());
+    Ok(y * 12 + m - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +70,12 @@ mod tests {
     fn dates() {
         assert_eq!(fmt_date(0), "1970-01-01");
         assert_eq!(fmt_date(1790178410), "2026-09-23");
+        assert_eq!(fmt_month(1790178410), "2026-09");
+        assert_eq!(
+            parse_month("2026-01").unwrap() - parse_month("2025-12").unwrap(),
+            1
+        );
+        assert!(parse_month("2026-13").is_err());
+        assert!(parse_month("26-01").is_err());
     }
 }
