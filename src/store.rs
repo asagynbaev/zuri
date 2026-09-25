@@ -1,13 +1,10 @@
-//! `.zuri/payroll.json`: every salary payment with the signatures of all the
-//! transactions it took. This is the input for day 2 (locating the transfer
-//! ciphertexts on-chain).
-
 use {
     anyhow::Result,
     serde::{Deserialize, Serialize},
     std::{fs, path::PathBuf},
 };
 
+/// What the demo has sent so far, kept in `.zuri/payroll.json`.
 #[derive(Serialize, Deserialize, Default)]
 pub struct Payroll {
     pub mint: String,
@@ -18,13 +15,9 @@ pub struct Payroll {
     pub transfers: Vec<TransferRecord>,
 }
 
-/// One confidential transfer = 5 transactions. The context-state accounts are
-/// closed in the last one, so only their addresses and the transaction data
-/// remain on-chain afterwards.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TransferRecord {
-    /// Base units. Kept for debugging only: the prover must re-derive it by
-    /// decryption and the verifier never sees it.
+    /// Plaintext amount, for debugging only.
     pub amount: u64,
     pub equality_context: String,
     pub validity_context: String,

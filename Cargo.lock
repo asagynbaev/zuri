@@ -4534,9 +4534,11 @@ name = "zuri"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytemuck",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "solana-address 2.8.0",
  "solana-commitment-config",
  "solana-instruction 3.5.1",

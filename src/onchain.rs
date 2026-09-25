@@ -1,29 +1,29 @@
-//! Day 2: recover a confidential transfer's ciphertexts from chain data alone.
+//! Reads confidential transfers back from the chain.
 //!
-//! Layout (context-state proof mode, as sent by `ct::transfer`):
-//! - The Token-2022 `Transfer` instruction carries only the auditor's lo/hi
-//!   ciphertexts. Its accounts are
-//!   `[source, mint, destination, equality_ctx, validity_ctx, range_ctx, authority]`.
-//! - The full grouped ciphertexts (one commitment + source/destination/auditor
-//!   handles, for lo and hi) live in the instruction data of the ZK ElGamal
-//!   proof program's `VerifyBatchedGroupedCiphertext3HandlesValidity`, sent in
-//!   an earlier transaction that wrote `validity_ctx`. The context account is
-//!   closed afterwards, so the instruction data is the durable copy.
+//! With proofs in context accounts, the Token-2022 `Transfer` instruction only
+//! carries the auditor ciphertexts. Its accounts are
+//! `[source, mint, destination, equality_ctx, validity_ctx, range_ctx, authority]`.
+//! The grouped ciphertexts with the recipient's handles are in the data of the
+//! `VerifyBatchedGroupedCiphertext3HandlesValidity` instruction that wrote
+//! `validity_ctx` in an earlier transaction:
 //!
-//! Byte offsets in that instruction's data:
-//!   0         discriminator
-//!   1..33     source ElGamal pubkey
-//!   33..65    destination ElGamal pubkey
-//!   65..97    auditor ElGamal pubkey
-//!   97..225   grouped ciphertext lo: commitment | source | destination | auditor handle
-//!   225..353  grouped ciphertext hi: same
-//!   353..     sigma proof
+//! ```text
+//! 0         discriminator
+//! 1..33     source pubkey
+//! 33..65    destination pubkey
+//! 65..97    auditor pubkey
+//! 97..225   lo: commitment | source | destination | auditor handle
+//! 225..353  hi: same
+//! 353..     proof
+//! ```
 
 use {
-    crate::chain::Chain,
     anyhow::{Context, Result, anyhow, bail, ensure},
     solana_address::Address,
     solana_commitment_config::CommitmentConfig,
+    solana_rpc_client::{
+        nonblocking::rpc_client::RpcClient, rpc_client::GetConfirmedSignaturesForAddress2Config,
+    },
     solana_rpc_client_types::config::RpcTransactionConfig,
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
@@ -48,14 +48,14 @@ use {
         },
         instruction::{decode_instruction_data, decode_instruction_type},
     },
+    std::str::FromStr,
 };
 
-/// Index of each party's decrypt handle inside a grouped ciphertext.
+/// Handle index of each party in a grouped ciphertext.
 pub const SOURCE: usize = 0;
 pub const DESTINATION: usize = 1;
 pub const AUDITOR: usize = 2;
 
-/// `TokenInstruction::ConfidentialTransferExtension`.
 const CONFIDENTIAL_TRANSFER_EXTENSION: u8 = 27;
 
 pub struct Tx {
@@ -64,21 +64,32 @@ pub struct Tx {
     pub tx: VersionedTransaction,
 }
 
-pub async fn fetch_tx(chain: &Chain, sig: &Signature) -> Result<Tx> {
+pub async fn fetch_tx(rpc: &RpcClient, sig: &Signature) -> Result<Tx> {
     let config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Base64),
         commitment: Some(CommitmentConfig::confirmed()),
         max_supported_transaction_version: Some(0),
     };
-    let encoded = chain.rpc.get_transaction_with_config(sig, config).await?;
-    let meta = encoded.transaction.meta.context("transaction has no status meta")?;
-    ensure!(meta.err.is_none(), "transaction {sig} failed: {:?}", meta.err);
-    let tx = encoded.transaction.transaction.decode().context("decode transaction")?;
-    Ok(Tx { slot: encoded.slot, block_time: encoded.block_time, tx })
+    let encoded = rpc.get_transaction_with_config(sig, config).await?;
+    let meta = encoded.transaction.meta.context("no status meta")?;
+    ensure!(
+        meta.err.is_none(),
+        "transaction {sig} failed: {:?}",
+        meta.err
+    );
+    let tx = encoded
+        .transaction
+        .transaction
+        .decode()
+        .context("decode transaction")?;
+    Ok(Tx {
+        slot: encoded.slot,
+        block_time: encoded.block_time,
+        tx,
+    })
 }
 
-/// Instructions of a legacy/v0 transaction without lookup tables, with their
-/// program id and account addresses resolved.
+// No lookup tables in our transactions, static keys are enough.
 fn instructions(tx: &VersionedTransaction) -> Vec<(Address, Vec<Address>, &[u8])> {
     let keys = tx.message.static_account_keys();
     tx.message
@@ -92,7 +103,6 @@ fn instructions(tx: &VersionedTransaction) -> Vec<(Address, Vec<Address>, &[u8])
         .collect()
 }
 
-/// The Token-2022 confidential `Transfer` instruction in a transaction.
 pub struct TransferIx {
     pub source: Address,
     pub mint: Address,
@@ -112,17 +122,19 @@ pub fn find_transfer(tx: &VersionedTransaction) -> Result<TransferIx> {
                 Ok(ConfidentialTransferInstruction::Transfer)
             )
     });
-    let (_, accounts, data) = found.next().context("no confidential Transfer instruction")?;
-    ensure!(found.next().is_none(), "more than one confidential Transfer in the transaction");
+    let (_, accounts, data) = found.next().context("no confidential transfer")?;
+    ensure!(
+        found.next().is_none(),
+        "more than one confidential transfer"
+    );
     let ix: &TransferInstructionData =
         decode_instruction_data(&data[1..]).map_err(|e| anyhow!("transfer data: {e}"))?;
-    // All three proofs referenced as context accounts, no instructions sysvar.
     ensure!(
         ix.equality_proof_instruction_offset == 0
             && ix.ciphertext_validity_proof_instruction_offset == 0
             && ix.range_proof_instruction_offset == 0
             && accounts.len() == 7,
-        "transfer does not use context-state proofs"
+        "transfer does not use context accounts for its proofs"
     );
     Ok(TransferIx {
         source: accounts[0],
@@ -135,12 +147,11 @@ pub fn find_transfer(tx: &VersionedTransaction) -> Result<TransferIx> {
     })
 }
 
-/// The ciphertext-validity verification that wrote `context`, re-verified
-/// off-chain from the instruction bytes.
+/// Finds the validity proof written into `context` and re-verifies it.
 pub fn find_validity_context(
     tx: &VersionedTransaction,
     context: &Address,
-) -> Result<BatchedGroupedCiphertext3HandlesValidityProofContext> {
+) -> Result<Option<BatchedGroupedCiphertext3HandlesValidityProofContext>> {
     for (program, accounts, data) in instructions(tx) {
         if program != solana_zk_elgamal_proof_interface::ID
             || accounts.first() != Some(context)
@@ -156,15 +167,62 @@ pub fn find_validity_context(
             BatchedGroupedCiphertext3HandlesValidityProofContext,
         >(data)
         .context("validity proof data")?;
-        proof.verify_proof().map_err(|e| anyhow!("validity proof does not verify: {e}"))?;
-        return Ok(*proof.context_data());
+        proof
+            .verify_proof()
+            .map_err(|e| anyhow!("validity proof: {e}"))?;
+        return Ok(Some(*proof.context_data()));
     }
-    bail!("no validity proof verification into {context}")
+    Ok(None)
 }
 
-/// One party's view of a grouped ciphertext.
-pub fn part(grouped: &PodGroupedElGamalCiphertext3Handles, index: usize) -> Result<ElGamalCiphertext> {
-    let grouped: GroupedElGamalCiphertext<3> =
-        (*grouped).try_into().map_err(|e| anyhow!("grouped ciphertext: {e:?}"))?;
-    grouped.to_elgamal_ciphertext(index).map_err(|e| anyhow!("{e:?}"))
+pub struct Transfer {
+    pub signature: Signature,
+    pub slot: u64,
+    pub block_time: Option<i64>,
+    pub ix: TransferIx,
+    pub validity: BatchedGroupedCiphertext3HandlesValidityProofContext,
+}
+
+/// Loads a transfer and its ciphertexts starting from the transfer signature.
+/// The validity proof is the last one written into the context account before
+/// the transfer.
+pub async fn fetch_transfer(rpc: &RpcClient, signature: &Signature) -> Result<Transfer> {
+    let transfer = fetch_tx(rpc, signature).await?;
+    let ix = find_transfer(&transfer.tx)?;
+    let history = rpc
+        .get_signatures_for_address_with_config(
+            &ix.validity_context,
+            GetConfirmedSignaturesForAddress2Config {
+                before: Some(*signature),
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    for entry in history.iter().filter(|e| e.err.is_none()) {
+        let tx = fetch_tx(rpc, &Signature::from_str(&entry.signature)?).await?;
+        if let Some(validity) = find_validity_context(&tx.tx, &ix.validity_context)? {
+            return Ok(Transfer {
+                signature: *signature,
+                slot: transfer.slot,
+                block_time: transfer.block_time,
+                ix,
+                validity,
+            });
+        }
+    }
+    bail!("no validity proof found for {signature}")
+}
+
+/// One party's ciphertext out of a grouped ciphertext.
+pub fn part(
+    grouped: &PodGroupedElGamalCiphertext3Handles,
+    index: usize,
+) -> Result<ElGamalCiphertext> {
+    let grouped: GroupedElGamalCiphertext<3> = (*grouped)
+        .try_into()
+        .map_err(|e| anyhow!("grouped ciphertext: {e:?}"))?;
+    grouped
+        .to_elgamal_ciphertext(index)
+        .map_err(|e| anyhow!("{e:?}"))
 }
