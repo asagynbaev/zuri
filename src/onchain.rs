@@ -20,6 +20,7 @@
 use {
     crate::{ct::PERIOD_MEMO, fmt_month, parse_month},
     anyhow::{Context, Result, anyhow, bail, ensure},
+    futures::{StreamExt, TryStreamExt, stream},
     solana_address::Address,
     solana_commitment_config::CommitmentConfig,
     solana_rpc_client::{
@@ -49,7 +50,11 @@ use {
         },
         instruction::{decode_instruction_data, decode_instruction_type},
     },
-    std::str::FromStr,
+    std::{
+        collections::HashMap,
+        str::FromStr,
+        sync::{Mutex, OnceLock},
+    },
 };
 
 /// Handle index of each party in a grouped ciphertext.
@@ -59,13 +64,24 @@ pub const AUDITOR: usize = 2;
 
 const CONFIDENTIAL_TRANSFER_EXTENSION: u8 = 27;
 
+#[derive(Clone)]
 pub struct Tx {
     pub slot: u64,
     pub block_time: Option<i64>,
     pub tx: VersionedTransaction,
 }
 
+// Confirmed transactions don't change, so each one is fetched once per process.
+// Proofs are still checked from scratch every time.
+fn cache() -> &'static Mutex<HashMap<Signature, Tx>> {
+    static CACHE: OnceLock<Mutex<HashMap<Signature, Tx>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 pub async fn fetch_tx(rpc: &RpcClient, sig: &Signature) -> Result<Tx> {
+    if let Some(tx) = cache().lock().unwrap().get(sig) {
+        return Ok(tx.clone());
+    }
     let config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Base64),
         commitment: Some(CommitmentConfig::confirmed()),
@@ -78,16 +94,17 @@ pub async fn fetch_tx(rpc: &RpcClient, sig: &Signature) -> Result<Tx> {
         "transaction {sig} failed: {:?}",
         meta.err
     );
-    let tx = encoded
-        .transaction
-        .transaction
-        .decode()
-        .context("decode transaction")?;
-    Ok(Tx {
+    let tx = Tx {
         slot: encoded.slot,
         block_time: encoded.block_time,
-        tx,
-    })
+        tx: encoded
+            .transaction
+            .transaction
+            .decode()
+            .context("decode transaction")?,
+    };
+    cache().lock().unwrap().insert(*sig, tx.clone());
+    Ok(tx)
 }
 
 // No lookup tables in our transactions, static keys are enough.
@@ -178,6 +195,7 @@ pub fn find_validity_context(
 
 pub struct Transfer {
     pub signature: Signature,
+    pub validity_signature: Signature,
     pub slot: u64,
     pub block_time: Option<i64>,
     pub ix: TransferIx,
@@ -209,37 +227,85 @@ fn find_period_memo(tx: &VersionedTransaction, authority: &Address) -> Option<St
         })
 }
 
-/// Loads a transfer and its ciphertexts starting from the transfer signature.
-/// The validity proof is the last one written into the context account before
-/// the transfer.
-pub async fn fetch_transfer(rpc: &RpcClient, signature: &Signature) -> Result<Transfer> {
-    let transfer = fetch_tx(rpc, signature).await?;
-    let ix = find_transfer(&transfer.tx)?;
-    let history = rpc
-        .get_signatures_for_address_with_config(
-            &ix.validity_context,
-            GetConfirmedSignaturesForAddress2Config {
-                before: Some(*signature),
-                commitment: Some(CommitmentConfig::confirmed()),
-                ..Default::default()
-            },
-        )
-        .await?;
-    for entry in history.iter().filter(|e| e.err.is_none()) {
-        let tx = fetch_tx(rpc, &Signature::from_str(&entry.signature)?).await?;
-        if let Some(validity) = find_validity_context(&tx.tx, &ix.validity_context)? {
-            let memo_period = find_period_memo(&transfer.tx, &ix.authority);
-            return Ok(Transfer {
-                signature: *signature,
-                slot: transfer.slot,
-                block_time: transfer.block_time,
-                ix,
-                validity,
-                memo_period,
-            });
+/// A transfer signature, plus the signature of its validity proof if known.
+#[derive(Clone, Copy)]
+pub struct TransferRef {
+    pub transfer: Signature,
+    pub validity: Option<Signature>,
+}
+
+/// Loads a transfer and its ciphertexts.
+///
+/// With a hint, the hinted transaction has to write the validity context the
+/// transfer uses, and land before it. Only whoever holds the context
+/// account's one-off keypair (the sender) can create that account, so the
+/// hint can't point at someone else's ciphertexts. Without a hint, the context
+/// account's history is searched, which is slower and rate-limited on devnet.
+pub async fn fetch_transfer(rpc: &RpcClient, r: TransferRef) -> Result<Transfer> {
+    let signature = r.transfer;
+    let (transfer, hinted) = match r.validity {
+        Some(validity) => {
+            let (t, v) = tokio::try_join!(fetch_tx(rpc, &signature), fetch_tx(rpc, &validity))?;
+            (t, Some((validity, v)))
         }
+        None => (fetch_tx(rpc, &signature).await?, None),
+    };
+    let ix = find_transfer(&transfer.tx)?;
+
+    let candidates = match hinted {
+        Some(found) => vec![found],
+        None => {
+            let history = rpc
+                .get_signatures_for_address_with_config(
+                    &ix.validity_context,
+                    GetConfirmedSignaturesForAddress2Config {
+                        before: Some(signature),
+                        commitment: Some(CommitmentConfig::confirmed()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let mut txs = vec![];
+            for entry in history.iter().filter(|e| e.err.is_none()) {
+                let sig = Signature::from_str(&entry.signature)?;
+                txs.push((sig, fetch_tx(rpc, &sig).await?));
+            }
+            txs
+        }
+    };
+
+    for (validity_signature, tx) in candidates {
+        let Some(validity) = find_validity_context(&tx.tx, &ix.validity_context)? else {
+            continue;
+        };
+        ensure!(
+            tx.slot <= transfer.slot,
+            "validity proof for {signature} lands after the transfer"
+        );
+        let memo_period = find_period_memo(&transfer.tx, &ix.authority);
+        return Ok(Transfer {
+            signature,
+            validity_signature,
+            slot: transfer.slot,
+            block_time: transfer.block_time,
+            ix,
+            validity,
+            memo_period,
+        });
     }
     bail!("no validity proof found for {signature}")
+}
+
+/// The public devnet RPC starts answering 429 beyond a few parallel requests.
+const RPC_CONCURRENCY: usize = 3;
+
+/// Same as `fetch_transfer` for many transfers, a few at a time, in order.
+pub async fn fetch_transfers(rpc: &RpcClient, refs: &[TransferRef]) -> Result<Vec<Transfer>> {
+    stream::iter(refs.iter().copied())
+        .map(|r| fetch_transfer(rpc, r))
+        .buffered(RPC_CONCURRENCY)
+        .try_collect()
+        .await
 }
 
 /// One party's ciphertext out of a grouped ciphertext.

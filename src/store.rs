@@ -45,6 +45,18 @@ impl Payroll {
         Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
     }
 
+    pub fn transfer_refs(&self) -> Result<Vec<crate::onchain::TransferRef>> {
+        self.transfers
+            .iter()
+            .map(|t| {
+                Ok(crate::onchain::TransferRef {
+                    transfer: t.transfer_sig.parse()?,
+                    validity: Some(t.validity_sig.parse()?),
+                })
+            })
+            .collect()
+    }
+
     pub fn save(&self) -> Result<()> {
         fs::create_dir_all(crate::keys::DIR)?;
         fs::write(path(), serde_json::to_string_pretty(self)?)?;

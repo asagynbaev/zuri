@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zuri · Your income</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400&family=JetBrains+Mono:wght@400;500&family=Public+Sans:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="bar">
+    <a class="mark" href="/">zuri</a>
+    <span class="role">Employee</span>
+    <span class="net">Solana devnet</span>
+  </header>
+
+  <main>
+    <p class="eyebrow" id="who">Loading account…</p>
+    <h1>Paid in private.<br><em>Proven on demand.</em></h1>
+    <p class="lede">
+      Your employer pays you with confidential transfers, so salaries are encrypted
+      on-chain. Only your key can read the amounts below.
+    </p>
+
+    <div class="split">
+      <section class="vault">
+        <div class="vault-head">
+          <h2>Your salary</h2>
+          <span class="lock">
+            <svg width="11" height="13" viewBox="0 0 11 13" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1" y="5.5" width="9" height="6.5" rx="1"/><path d="M3 5.5V3.8a2.5 2.5 0 0 1 5 0v1.7"/></svg>
+            Decrypted on this device
+          </span>
+        </div>
+        <div class="working on" id="loading"><i></i>Reading your payments from Solana</div>
+        <ul class="rows" id="months"></ul>
+        <div class="total" id="total" hidden><span>Total received</span><span></span></div>
+      </section>
+
+      <section class="panel">
+        <h2>Share proof of income</h2>
+        <p class="small">For a landlord, a bank or a visa office. They get a yes or a no, not your salary.</p>
+
+        <form id="prove">
+          <p class="claim">
+            I was paid at least $<input class="money" id="min" value="3,000" inputmode="decimal" aria-label="Minimum per month">
+            every month for the last <input id="months-count" value="6" inputmode="numeric" aria-label="Number of months">
+            months.
+          </p>
+          <button type="submit" id="create" disabled>Create proof</button>
+          <div class="working" id="proving"><i></i>Generating zero-knowledge proofs</div>
+          <p class="error" id="prove-error" hidden></p>
+        </form>
+
+        <div class="share" id="share" hidden>
+          <p class="small">Anyone with this link can check it against Solana.</p>
+          <div class="link">
+            <input id="link" readonly>
+            <button class="quiet" type="button" id="copy">Copy</button>
+          </div>
+          <a class="small" id="open" target="_blank" rel="noopener">Open as verifier ↗</a>
+        </div>
+
+        <div class="preview">
+          <p class="eyebrow">What they will see</p>
+          <ul class="rows ledger" id="preview"></ul>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+  <script>
+    const $ = (s) => document.querySelector(s)
+    let income = null
+
+    function renderIncome() {
+      $('#who').replaceChildren('Account ', h('span', { class: 'addr' }, short(income.employee)),
+        ' · employer ', h('span', { class: 'addr' }, short(income.employer)))
+      const rows = [...income.months].reverse().map((m, i) =>
+        h('li', { class: 'row', style: `--i:${i}` },
+          h('span', { class: 'month' }, monthName(m.period)),
+          h('span', { class: 'amount' }, usd(m.total)),
+          h('span', { class: 'meta' },
+            m.payments.length === 1 ? '1 payment' : m.payments.length + ' payments',
+            txLinks(m.payments.map((p) => p.signature)))))
+      $('#months').replaceChildren(...rows)
+      const total = income.months.reduce((sum, m) => sum + m.total, 0)
+      $('#total').lastElementChild.textContent = usd(total)
+      $('#total').hidden = false
+      $('#loading').classList.remove('on')
+      $('#create').disabled = false
+      renderPreview()
+    }
+
+    function chosenMonths() {
+      const n = parseInt($('#months-count').value, 10) || 0
+      return income ? income.months.slice(-n) : []
+    }
+
+    function renderPreview() {
+      const min = Math.round(parseFloat(amountInput($('#min').value)) * 100) || 0
+      const rows = [...chosenMonths()].reverse().map((m, i) =>
+        h('li', { class: 'row', style: `--i:${i}` },
+          h('span', { class: 'month' }, monthName(m.period, 'short')),
+          h('span', { class: 'redacted', style: `--w:${barWidth(i)}` }),
+          h('span', { class: 'clears' }, '≥ ' + usd(min) + ' ✓')))
+      $('#preview').replaceChildren(...rows)
+    }
+
+    $('#min').addEventListener('input', renderPreview)
+    $('#months-count').addEventListener('input', renderPreview)
+
+    $('#prove').addEventListener('submit', async (e) => {
+      e.preventDefault()
+      const min = amountInput($('#min').value)
+      const months = parseInt($('#months-count').value, 10)
+      $('#create').disabled = true
+      $('#proving').classList.add('on')
+      $('#prove-error').hidden = true
+      try {
+        const { id } = await api('/api/proofs', { min, months })
+        const params = new URLSearchParams({ employer: income.employer, min, months })
+        const url = `${location.origin}/v/${id}?${params}`
+        $('#link').value = url
+        $('#open').href = url
+        $('#share').hidden = false
+      } catch (err) {
+        $('#prove-error').textContent = err.message
+        $('#prove-error').hidden = false
+      } finally {
+        $('#create').disabled = false
+        $('#proving').classList.remove('on')
+      }
+    })
+
+    $('#copy').addEventListener('click', async () => {
+      await navigator.clipboard.writeText($('#link').value)
+      $('#copy').textContent = 'Copied'
+      setTimeout(() => ($('#copy').textContent = 'Copy'), 1500)
+    })
+
+    api('/api/income')
+      .then((data) => {
+        income = data
+        renderIncome()
+      })
+      .catch((err) => {
+        $('#loading').classList.remove('on')
+        $('#months').replaceChildren(h('li', { class: 'error' }, err.message))
+      })
+  </script>
+</body>
+</html>

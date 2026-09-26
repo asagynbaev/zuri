@@ -180,8 +180,15 @@ pub struct IncomeProof {
 pub struct Period {
     /// YYYY-MM, or "all".
     pub label: String,
-    pub transfers: Vec<String>,
+    pub transfers: Vec<ProvenTransfer>,
     pub equality: String,
+}
+
+/// A salary transfer and the transaction that verified its ciphertexts.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProvenTransfer {
+    pub transfer: String,
+    pub validity: String,
 }
 
 fn encode<T: bytemuck::Pod>(value: &T) -> String {
@@ -200,37 +207,66 @@ fn recipient_part(t: &onchain::Transfer) -> Result<(ElGamalCiphertext, ElGamalCi
     ))
 }
 
-/// Returns the proof and the decrypted total of each period.
-pub async fn prove(
+/// A salary as the employee sees it.
+pub struct Payment {
+    pub transfer: onchain::Transfer,
+    pub amount: u64,
+}
+
+/// Loads the employee's incoming transfers and decrypts the amounts.
+pub async fn payments(
     rpc: &RpcClient,
     employee: &Keypair,
     mint: &Address,
-    transfers: &[Signature],
+    refs: &[onchain::TransferRef],
+) -> Result<Vec<Payment>> {
+    let account = ct::token_account(&employee.pubkey(), mint);
+    let (keypair, _) = ct::account_keys(employee, &account)?;
+    let decrypt = |ct: &ElGamalCiphertext| ct.decrypt_u32(keypair.secret()).context("decrypt");
+    onchain::fetch_transfers(rpc, refs)
+        .await?
+        .into_iter()
+        .map(|transfer| {
+            let sig = transfer.signature;
+            ensure!(
+                transfer.ix.destination == account,
+                "{sig} was not sent to {account}"
+            );
+            let (lo, hi) = recipient_part(&transfer)?;
+            let amount = decrypt(&lo)? + (decrypt(&hi)? << 16);
+            Ok(Payment { transfer, amount })
+        })
+        .collect()
+}
+
+/// Returns the proof and the decrypted total of each period.
+pub fn prove(
+    employee: &Keypair,
+    mint: &Address,
+    payments: &[Payment],
     min: u64,
     monthly: bool,
 ) -> Result<(IncomeProof, Vec<(String, u64)>)> {
     let account = ct::token_account(&employee.pubkey(), mint);
     let (keypair, _) = ct::account_keys(employee, &account)?;
-    let decrypt = |ct: &ElGamalCiphertext| ct.decrypt_u32(keypair.secret()).context("decrypt");
 
     // label -> (signatures, ciphertext sum, total)
-    let mut periods: BTreeMap<String, (Vec<String>, ElGamalCiphertext, u64)> = BTreeMap::new();
-    for sig in transfers {
-        let t = onchain::fetch_transfer(rpc, sig).await?;
-        ensure!(
-            t.ix.destination == account,
-            "{sig} was not sent to {account}"
-        );
+    let mut periods: BTreeMap<String, (Vec<ProvenTransfer>, ElGamalCiphertext, u64)> =
+        BTreeMap::new();
+    for Payment { transfer, amount } in payments {
         let label = if monthly {
-            t.period()?
+            transfer.period()?
         } else {
             ALL.to_string()
         };
-        let (lo, hi) = recipient_part(&t)?;
+        let (lo, hi) = recipient_part(transfer)?;
         let entry = periods.entry(label).or_default();
-        entry.0.push(sig.to_string());
+        entry.0.push(ProvenTransfer {
+            transfer: transfer.signature.to_string(),
+            validity: transfer.validity_signature.to_string(),
+        });
         entry.1 = entry.1 + combine(&lo, &hi);
-        entry.2 += decrypt(&lo)? + (decrypt(&hi)? << 16);
+        entry.2 += amount;
     }
 
     let inputs: Vec<_> = periods
@@ -304,8 +340,7 @@ pub async fn verify(
 
     let mut labels = BTreeSet::new();
     let mut signatures = BTreeSet::new();
-    let mut sums = vec![];
-    let mut times = vec![];
+    let mut listed = vec![];
     for period in &proof.periods {
         ensure!(
             labels.insert(&period.label),
@@ -317,11 +352,23 @@ pub async fn verify(
             "period {} is empty",
             period.label
         );
-        let mut sum = ElGamalCiphertext::default();
-        for s in &period.transfers {
-            let sig = Signature::from_str(s)?;
+        for t in &period.transfers {
+            let sig = Signature::from_str(&t.transfer)?;
             ensure!(signatures.insert(sig), "{sig} is listed twice");
-            let t = onchain::fetch_transfer(rpc, &sig).await?;
+            listed.push(onchain::TransferRef {
+                transfer: sig,
+                validity: Some(Signature::from_str(&t.validity)?),
+            });
+        }
+    }
+
+    let mut transfers = onchain::fetch_transfers(rpc, &listed).await?.into_iter();
+    let mut sums = vec![];
+    let mut times = vec![];
+    for period in &proof.periods {
+        let mut sum = ElGamalCiphertext::default();
+        for t in transfers.by_ref().take(period.transfers.len()) {
+            let sig = t.signature;
             ensure!(t.ix.mint == mint, "{sig}: different mint");
             ensure!(t.ix.source == source, "{sig}: not from the employer");
             ensure!(
@@ -363,6 +410,25 @@ pub async fn verify(
             .map(|b| format!("{b:02x}"))
             .collect(),
     })
+}
+
+/// At least `n` calendar months in a row, no gaps. Labels come sorted.
+pub fn check_consecutive(periods: &[String], n: usize) -> Result<()> {
+    let months = periods
+        .iter()
+        .map(|p| crate::parse_month(p))
+        .collect::<Result<Vec<_>>>()
+        .context("proof is not split by month")?;
+    ensure!(
+        months.len() >= n,
+        "covers {} months, need {n}",
+        months.len()
+    );
+    ensure!(
+        months.windows(2).all(|w| w[1] == w[0] + 1),
+        "months are not consecutive"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -2,9 +2,8 @@ use {
     anyhow::{Result, bail},
     solana_address::Address,
     solana_keypair::Keypair,
-    solana_signature::Signature,
     solana_signer::Signer,
-    std::{path::Path, str::FromStr},
+    std::path::Path,
     zuri::{
         chain::{Chain, LAMPORTS_PER_SOL},
         ct, fmt_amount, keys, onchain, parse_amount, parse_month, proof,
@@ -174,12 +173,8 @@ async fn balances(chain: &Chain, employee: &Keypair, mint: &Address) -> Result<(
     Ok(())
 }
 
-fn transfer_signatures() -> Result<Vec<Signature>> {
-    Payroll::load()?
-        .transfers
-        .iter()
-        .map(|t| Ok(Signature::from_str(&t.transfer_sig)?))
-        .collect()
+fn transfer_refs() -> Result<Vec<onchain::TransferRef>> {
+    Payroll::load()?.transfer_refs()
 }
 
 async fn inspect(chain: &Chain, employee: &Keypair, mint: &Address) -> Result<()> {
@@ -194,8 +189,8 @@ async fn inspect(chain: &Chain, employee: &Keypair, mint: &Address) -> Result<()
         .map(|a| a.ext.elgamal_pubkey);
 
     let mut total = 0;
-    for sig in transfer_signatures()? {
-        let t = onchain::fetch_transfer(&chain.rpc, &sig).await?;
+    for t in onchain::fetch_transfers(&chain.rpc, &transfer_refs()?).await? {
+        let sig = t.signature;
         let (lo, hi) = (
             &t.validity.grouped_ciphertext_lo,
             &t.validity.grouped_ciphertext_hi,
@@ -251,9 +246,9 @@ async fn prove(
     out: &str,
 ) -> Result<()> {
     let min = parse_amount(min)?;
-    let transfers = transfer_signatures()?;
-    let (proof, totals) =
-        proof::prove(&chain.rpc, employee, mint, &transfers, min, monthly).await?;
+    let transfers = transfer_refs()?;
+    let payments = proof::payments(&chain.rpc, employee, mint, &transfers).await?;
+    let (proof, totals) = proof::prove(employee, mint, &payments, min, monthly)?;
     std::fs::write(out, serde_json::to_string_pretty(&proof)?)?;
     for (period, total) in totals {
         println!("{period}: {}", fmt_amount(total));

@@ -2,10 +2,10 @@
 //! data and the proof file.
 
 use {
-    anyhow::{Context, Result, bail, ensure},
+    anyhow::{Context, Result, bail},
     solana_address::Address,
     std::str::FromStr,
-    zuri::{chain, fmt_amount, fmt_date, parse_amount, parse_month, proof},
+    zuri::{chain, fmt_amount, fmt_date, parse_amount, proof},
 };
 
 const USAGE: &str =
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     let result = async {
         let verdict = proof::verify(&chain::rpc(), &proof, &employer, min).await?;
         if let Some(n) = months {
-            consecutive_months(&verdict.periods, n)?;
+            proof::check_consecutive(&verdict.periods, n)?;
         }
         Ok::<_, anyhow::Error>(verdict)
     };
@@ -70,23 +70,4 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     }
-}
-
-/// At least `n` calendar months in a row, no gaps. Labels come sorted.
-fn consecutive_months(periods: &[String], n: usize) -> Result<()> {
-    let months = periods
-        .iter()
-        .map(|p| parse_month(p))
-        .collect::<Result<Vec<_>>>()
-        .context("proof is not split by month")?;
-    ensure!(
-        months.len() >= n,
-        "covers {} months, need {n}",
-        months.len()
-    );
-    ensure!(
-        months.windows(2).all(|w| w[1] == w[0] + 1),
-        "months are not consecutive"
-    );
-    Ok(())
 }

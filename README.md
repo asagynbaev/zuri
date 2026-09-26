@@ -63,6 +63,24 @@ The verifier rejects transfers from another sender or to another recipient,
 repeated signatures, transfers listed under the wrong month, a changed transfer
 set, gaps between months and thresholds above the proven one.
 
+## Web demo
+
+```
+cargo run --release --bin zuri-web     # or ./scripts/web.ps1
+```
+
+http://localhost:8787 is the employee side: salaries decrypted by month and a
+form that turns "at least X every month for N months" into a proof and a link.
+The link opens the verifier side, which checks the proof against Solana and
+shows the months with the amounts blacked out.
+
+The employee page uses the employee key from `.zuri/`, standing in for a
+wallet. The verifier page only needs the proof and chain data.
+
+The public devnet RPC allows about ten `getTransaction` calls per window, so
+the first load takes around half a minute. Point `ZURI_RPC_URL` at a dedicated
+devnet endpoint to avoid that.
+
 ## Where the ciphertexts are
 
 A confidential transfer with proofs in context accounts takes five
@@ -71,10 +89,11 @@ ciphertexts. The ones for the recipient are in the data of the
 `VerifyBatchedGroupedCiphertext3HandlesValidity` instruction that wrote the
 validity context account, which the transfer references. `src/onchain.rs` has
 the byte layout and finds that instruction starting from the transfer
-signature.
+signature. Proofs carry the signature of each validity transaction as well,
+so the verifier doesn't have to search account history for it.
 
 ## Not done yet
 
 - employer verification, so "from a verified employer" means something
 - verifying the proof on-chain
-- a UI
+- generating proofs in the browser or wallet instead of the demo server

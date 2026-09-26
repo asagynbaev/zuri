@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zuri · Income check</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400&family=JetBrains+Mono:wght@400;500&family=Public+Sans:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+    <filter id="ink">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="4" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.6" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </svg>
+
+  <header class="bar">
+    <a class="mark" href="/">zuri</a>
+    <span class="role">Verifier</span>
+    <span class="net">Solana devnet</span>
+  </header>
+
+  <main>
+    <p class="eyebrow">Income check</p>
+    <h1>Does their income<br><em>clear the bar?</em></h1>
+    <p class="lede">
+      Someone shared a Zuri proof with you. It is checked against Solana right here:
+      you learn whether each month clears your minimum, never how much they earned.
+    </p>
+
+    <section class="panel" style="margin-top: 44px; max-width: 760px">
+      <form id="check">
+        <p class="claim">
+          Paid by employer
+          <input class="address" id="employer" spellcheck="false" placeholder="employer address" aria-label="Employer address">
+          at least $<input class="money" id="min" inputmode="decimal" aria-label="Minimum per month">
+          every month for <input id="months" inputmode="numeric" aria-label="Months in a row"> months in a row.
+        </p>
+        <button type="submit" id="go">Check on Solana</button>
+        <div class="working" id="working"><i></i><span id="working-text">Reading transfers from Solana</span></div>
+        <p class="error" id="error" hidden></p>
+      </form>
+    </section>
+
+    <section class="result" id="result" hidden>
+      <div class="verdict">
+        <div class="stamp" id="stamp"><b></b><small></small></div>
+        <div>
+          <p class="statement" id="statement"></p>
+          <p class="reason" id="reason" hidden></p>
+        </div>
+      </div>
+
+      <ul class="rows ledger" id="ledger"></ul>
+
+      <dl class="facts" id="facts"></dl>
+      <p class="note" id="note"></p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+  <script>
+    const $ = (s) => document.querySelector(s)
+    const id = location.pathname.split('/').pop()
+    const query = new URLSearchParams(location.search)
+    $('#employer').value = query.get('employer') || ''
+    $('#min').value = Number(query.get('min') || 3000).toLocaleString('en-US')
+    $('#months').value = query.get('months') || 6
+
+    function stampDate(unix) {
+      return new Date(unix * 1000).toLocaleString('en-US', {
+        day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC',
+      }) + ' UTC'
+    }
+
+    function render(r, employer) {
+      const months = r.periods.map((p) => p.label)
+      const [first, last] = [months[0], months[months.length - 1]]
+
+      $('#stamp').className = 'stamp' + (r.ok ? '' : ' no')
+      $('#stamp b').textContent = r.ok ? 'Verified' : 'Not verified'
+      $('#stamp small').textContent = 'Solana devnet · ' + day(r.checked_at)
+
+      const statement = $('#statement')
+      if (r.ok && first !== 'all') {
+        statement.replaceChildren(
+          h('strong', {}, short(r.employee)), ' was paid at least ', h('strong', {}, usd(r.min)),
+          ' every month from ', h('strong', {}, monthName(first, 'long').split(' ')[0]),
+          ' to ', h('strong', {}, monthName(last)), ' by employer ', h('strong', {}, short(employer)), '.')
+      } else if (r.ok) {
+        statement.replaceChildren(
+          h('strong', {}, short(r.employee)), ' was paid at least ', h('strong', {}, usd(r.min)),
+          ' in total by employer ', h('strong', {}, short(employer)), '.')
+      } else {
+        statement.replaceChildren('This proof does not show that ', h('strong', {}, short(r.employee)),
+          ' meets your requirement.')
+      }
+      $('#reason').textContent = r.error || ''
+      $('#reason').hidden = r.ok
+
+      $('#ledger').replaceChildren(...r.periods.map((p, i) =>
+        h('li', { class: 'row', style: `--i:${i}` },
+          h('span', { class: 'month' }, monthName(p.label)),
+          h('span', { class: 'redacted', style: `--w:${barWidth(i)}` }),
+          h('span', { class: 'clears' + (r.ok ? '' : ' unknown') }, r.ok ? '≥ ' + usd(r.min) + ' ✓' : 'not proven'),
+          h('span', { class: 'meta' },
+            p.transfers.length === 1 ? '1 payment' : p.transfers.length + ' payments',
+            txLinks(p.transfers)))))
+
+      const facts = [
+        ['Employee', r.employee],
+        ['Employer', employer],
+        ['Payments', String(r.transfers)],
+        r.first_time && ['Paid between', day(r.first_time) + ' – ' + day(r.last_time)],
+        r.tx_set_hash && ['Transaction set', r.tx_set_hash],
+        ['Checked', stampDate(r.checked_at)],
+      ].filter(Boolean)
+      $('#facts').replaceChildren(...facts.flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, v)]))
+
+      $('#note').textContent = r.ok
+        ? `Zuri rebuilt each month's encrypted total from ${r.transfers} confidential transfers on Solana ` +
+          `and checked zero-knowledge proofs that every total is at least ${usd(r.min)}. ` +
+          'The amounts stayed encrypted; open any payment above to see what the chain shows.'
+        : 'Nothing was decrypted. The proof and the chain data did not match the requirement above.'
+
+      $('#result').hidden = false
+    }
+
+    async function check() {
+      const employer = $('#employer').value.trim()
+      const months = parseInt($('#months').value, 10)
+      $('#go').disabled = true
+      $('#error').hidden = true
+      $('#working').classList.add('on')
+      try {
+        const r = await api('/api/verify', {
+          id, employer, min: amountInput($('#min').value), months: months || null,
+        })
+        render(r, employer)
+      } catch (err) {
+        $('#error').textContent = err.message
+        $('#error').hidden = false
+      } finally {
+        $('#go').disabled = false
+        $('#working').classList.remove('on')
+      }
+    }
+
+    $('#check').addEventListener('submit', (e) => {
+      e.preventDefault()
+      check()
+    })
+
+    if (query.get('employer')) check()
+  </script>
+</body>
+</html>
